@@ -3,9 +3,11 @@
     "step": {
       "user": {
         "title": "Set up Clap Sensor (USB Microphone)",
-        "description": "Configures double and triple clap detection via an attached USB microphone (e.g. USB webcam) or via events from the Clap Sensor Add-on.",
+        "description": "Select which entity should be toggled directly on 2x or 3x clap (works out-of-the-box without a separate automation!).",
         "data": {
-          "input_device": "Audio input device ('default' for default USB mic or 'event_only')",
+          "target_entity_id": "Action on 2x Clap (Toggle entity, e.g. Light/Switch)",
+          "triple_clap_entity_id": "Action on 3x Clap (Optional: Toggle entity)",
+          "input_device": "Audio input device ('auto' detects USB webcam automatically)",
           "min_amplitude": "Minimum peak amplitude (0.005 to 0.95)",
           "snr_threshold_db": "Minimum SNR above background/fan noise in dB",
           "min_high_freq_ratio": "Min. high-frequency ratio 1–4.8 kHz (filters low thuds)",
@@ -20,9 +22,11 @@
   "options": {
     "step": {
       "init": {
-        "title": "Adjust Clap Sensor Sensitivity",
+        "title": "Clap Sensor Actions & Sensitivity",
         "data": {
-          "input_device": "Audio input device ('default' or 'event_only')",
+          "target_entity_id": "Action on 2x Clap (Toggle entity, e.g. Light/Switch)",
+          "triple_clap_entity_id": "Action on 3x Clap (Optional: Toggle entity)",
+          "input_device": "Audio input device ('auto' detects USB webcam automatically)",
           "min_amplitude": "Minimum peak amplitude (0.005 to 0.95)",
           "snr_threshold_db": "Minimum SNR above background/fan noise in dB",
           "min_high_freq_ratio": "Min. high-frequency ratio 1–4.8 kHz (filters low thuds)",

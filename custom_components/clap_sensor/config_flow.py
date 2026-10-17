@@ -7,6 +7,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers import selector
 
 from .const import (
     CONF_ENABLE_TRIPLE_CLAP,
@@ -14,6 +15,8 @@ from .const import (
     CONF_MIN_AMPLITUDE,
     CONF_MIN_HIGH_FREQ_RATIO,
     CONF_SNR_THRESHOLD_DB,
+    CONF_TARGET_ENTITY_ID,
+    CONF_TRIPLE_ENTITY_ID,
     DEFAULT_ENABLE_TRIPLE_CLAP,
     DEFAULT_INPUT_DEVICE,
     DEFAULT_MIN_AMPLITUDE,
@@ -24,34 +27,52 @@ from .const import (
 
 
 def _get_schema(defaults: dict[str, Any]) -> vol.Schema:
-    return vol.Schema(
-        {
-            vol.Optional(
-                CONF_INPUT_DEVICE,
-                default=defaults.get(CONF_INPUT_DEVICE, DEFAULT_INPUT_DEVICE),
-            ): str,
-            vol.Optional(
-                CONF_MIN_AMPLITUDE,
-                default=defaults.get(CONF_MIN_AMPLITUDE, DEFAULT_MIN_AMPLITUDE),
-            ): vol.All(vol.Coerce(float), vol.Range(min=0.005, max=0.95)),
-            vol.Optional(
-                CONF_SNR_THRESHOLD_DB,
-                default=defaults.get(CONF_SNR_THRESHOLD_DB, DEFAULT_SNR_THRESHOLD_DB),
-            ): vol.All(vol.Coerce(float), vol.Range(min=4.0, max=35.0)),
-            vol.Optional(
-                CONF_MIN_HIGH_FREQ_RATIO,
-                default=defaults.get(
-                    CONF_MIN_HIGH_FREQ_RATIO, DEFAULT_MIN_HIGH_FREQ_RATIO
-                ),
-            ): vol.All(vol.Coerce(float), vol.Range(min=0.10, max=0.85)),
-            vol.Optional(
-                CONF_ENABLE_TRIPLE_CLAP,
-                default=defaults.get(
-                    CONF_ENABLE_TRIPLE_CLAP, DEFAULT_ENABLE_TRIPLE_CLAP
-                ),
-            ): bool,
-        }
-    )
+    target_default = defaults.get(CONF_TARGET_ENTITY_ID, "")
+    triple_default = defaults.get(CONF_TRIPLE_ENTITY_ID, "")
+
+    schema_dict: dict[Any, Any] = {
+        vol.Optional(
+            CONF_TARGET_ENTITY_ID,
+            description={"suggested_value": target_default if target_default else None},
+        ): selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain=["light", "switch", "input_boolean", "script", "scene", "fan", "media_player"]
+            )
+        ),
+        vol.Optional(
+            CONF_TRIPLE_ENTITY_ID,
+            description={"suggested_value": triple_default if triple_default else None},
+        ): selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain=["light", "switch", "input_boolean", "script", "scene", "fan", "media_player"]
+            )
+        ),
+        vol.Optional(
+            CONF_INPUT_DEVICE,
+            default=defaults.get(CONF_INPUT_DEVICE, DEFAULT_INPUT_DEVICE),
+        ): str,
+        vol.Optional(
+            CONF_MIN_AMPLITUDE,
+            default=defaults.get(CONF_MIN_AMPLITUDE, DEFAULT_MIN_AMPLITUDE),
+        ): vol.All(vol.Coerce(float), vol.Range(min=0.005, max=0.95)),
+        vol.Optional(
+            CONF_SNR_THRESHOLD_DB,
+            default=defaults.get(CONF_SNR_THRESHOLD_DB, DEFAULT_SNR_THRESHOLD_DB),
+        ): vol.All(vol.Coerce(float), vol.Range(min=4.0, max=35.0)),
+        vol.Optional(
+            CONF_MIN_HIGH_FREQ_RATIO,
+            default=defaults.get(
+                CONF_MIN_HIGH_FREQ_RATIO, DEFAULT_MIN_HIGH_FREQ_RATIO
+            ),
+        ): vol.All(vol.Coerce(float), vol.Range(min=0.10, max=0.85)),
+        vol.Optional(
+            CONF_ENABLE_TRIPLE_CLAP,
+            default=defaults.get(
+                CONF_ENABLE_TRIPLE_CLAP, DEFAULT_ENABLE_TRIPLE_CLAP
+            ),
+        ): bool,
+    }
+    return vol.Schema(schema_dict)
 
 
 class ClapSensorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -86,7 +107,7 @@ class ClapSensorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class ClapSensorOptionsFlowHandler(config_entries.OptionsFlow):
-    """Erlaubt das nachträgliche Anpassen der Empfindlichkeit über 'Konfigurieren'."""
+    """Erlaubt das nachträgliche Anpassen der Empfindlichkeit & Ziel-Entitäten über 'Konfigurieren'."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         self._config_entry = config_entry
