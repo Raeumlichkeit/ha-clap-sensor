@@ -65,28 +65,29 @@ class BlockDiagnostics:
 
 class ClapDetector:
     """
-    Raumhall-optimierter Echtzeit-Klatschdetektor (DSP + FFT + Zustandsmaschine):
+    Mehrstufiger Echtzeit-Klatschdetektor (DSP + FFT + Zustandsmaschine):
     1. Hochpass-Filterung (> 800 Hz) vor der Rauschpegel-Messung blendet
        Proxmox-Serverlüfter und tieffrequentes Brummen aus.
-    2. Dynamische Peak-Release-Erkennung (35 % vom Impuls-Peak) trennt den
-       eigentlichen Klatsch-Impuls sauber vom Raum-Nachhall (Reverb).
-    3. Einfrieren des Noise-Floors nach Klatsch #1 verhindert, dass der Nachhall
-       des 1. Klatschens die Schwelle für das 2. Klatschen anhebt.
-    4. Spektrale Band-Ratio (900-5000 Hz vs. Tiefton 120-750 Hz) filtert
+    2. Saubere Hysterese (Release < 65 % der Startschwelle + Pflicht-Ruhepause)
+       verhindert, dass ein einzelner lauter Klatsch durch Raum-Nachhall doppelt gezählt wird.
+    3. Spektrale Band-Ratio (1000-4800 Hz vs. Tiefton 120-750 Hz) filtert
        dumpfe Tischstöße, Schritte und Türenschlagen heraus.
+    4. Zustandsmaschine mit Settle-Window unterscheidet sauber zwischen
+       Einzelklatsch (ignoriert), Doppelklatsch (2x), Dreifachklatsch (3x)
+       und Applaus (>= 4x, ignoriert).
     """
 
     def __init__(
         self,
         sample_rate: int = 16000,
-        min_amplitude: float = 0.02,
-        snr_threshold_db: float = 8.5,
-        max_clap_duration_ms: float = 200.0,
-        min_high_freq_ratio: float = 0.24,
-        double_clap_min_gap_ms: float = 100.0,
-        double_clap_max_gap_ms: float = 850.0,
+        min_amplitude: float = 0.18,
+        snr_threshold_db: float = 18.0,
+        max_clap_duration_ms: float = 160.0,
+        min_high_freq_ratio: float = 0.65,
+        double_clap_min_gap_ms: float = 170.0,
+        double_clap_max_gap_ms: float = 700.0,
         settle_window_ms: float = 480.0,
-        cooldown_ms: float = 1200.0,
+        cooldown_ms: float = 1500.0,
         enable_triple_clap: bool = True,
         highpass_cutoff_hz: float = 800.0,
         input_guard: Optional[WindowsInputGuard] = None,
@@ -108,7 +109,7 @@ class ClapDetector:
         self.input_guard = input_guard
 
         self._noise_history: Deque[float] = deque(maxlen=60)
-        self._noise_floor: float = 0.0025
+        self._noise_floor: float = 0.003
 
         self._in_impulse: bool = False
         self._impulse_start_ms: float = 0.0
@@ -117,6 +118,7 @@ class ClapDetector:
         self._impulse_snr_db: float = 0.0
         self._impulse_hf_ratio: float = 0.0
         self._impulse_invalidated: bool = False
+        self._quiet_blocks_since_impulse: int = 10
 
         self._clap_times: List[float] = []
         self._clap_peaks: List[float] = []
@@ -173,7 +175,7 @@ class ClapDetector:
         hp_rms = float(np.sqrt(np.mean(x_hp * x_hp)) + 1e-9)
 
         total_relevant_mask = (freqs >= 120.0) & (freqs <= 6500.0)
-        clap_band_mask = (freqs >= 900.0) & (freqs <= 5200.0)
+        clap_band_mask = (freqs >= 1000.0) & (freqs <= 4800.0)
         low_thud_mask = (freqs >= 120.0) & (freqs < 750.0)
 
         total_energy = float(np.sum(power[total_relevant_mask])) + 1e-12
@@ -203,14 +205,18 @@ class ClapDetector:
             return None
 
         required_linear_snr = 10.0 ** (self.snr_threshold_db / 20.0)
-        # Falls bereits Klatsch #1 erkannt wurde, senken wir die Schwelle für Klatsch #2 leicht um 15 %,
-        # da beim Doppelklatschen ein Schlag oft minimal leiser ist als der andere!
-        if self._clap_times:
-            required_linear_snr *= 0.82
         onset_threshold = max(self.min_amplitude, self._noise_floor * required_linear_snr)
+        # WICHTIG: Release-Schwelle liegt strikt UNTER der Onset-Schwelle (55 %),
+        # damit das Ausklingen desselben Klatschers niemals sofort einen 2. Impuls startet!
+        release_threshold = max(
+            self.min_amplitude * 0.50,
+            self._noise_floor * (required_linear_snr * 0.50),
+        )
 
         if not self._in_impulse:
-            if hp_peak >= onset_threshold:
+            # Mindestens 3 ruhige Blöcke (~48 ms echte Stille unter der Release-Schwelle)
+            # müssen nach einem Impuls vergangen sein, bevor ein neuer Klatsch-Impuls starten darf!
+            if hp_peak >= onset_threshold and self._quiet_blocks_since_impulse >= 3:
                 if self.input_guard and self.input_guard.is_user_typing_or_clicking():
                     diag.rejected_reason = "pc_input_guard_active"
                     self.last_diagnostics = diag
@@ -223,28 +229,26 @@ class ClapDetector:
                 self._impulse_snr_db = snr_db
                 self._impulse_hf_ratio = high_freq_ratio
                 self._impulse_invalidated = False
+                self._quiet_blocks_since_impulse = 0
             else:
-                # Wichtig: Während wir auf den 2./3. Klatsch warten, den Noise-Floor NICHT durch Raumhall anheben!
+                if hp_peak < release_threshold:
+                    self._quiet_blocks_since_impulse += 1
                 if not self._clap_times:
                     self._update_noise_floor_if_quiet(hp_rms, hp_peak)
         else:
-            # Sobald der Pegel unter 38 % des Impuls-Maximums (oder unter 55 % der Startschwelle) fällt,
-            # ist der eigentliche Handklatsch vorbei und nur noch Raum-Nachhall übrig.
-            dynamic_release = max(
-                onset_threshold * 0.55,
-                self._impulse_peak * 0.38,
-            )
-            if hp_peak >= dynamic_release:
+            if hp_peak >= release_threshold:
                 self._impulse_last_active_ms = now_ms
                 if hp_peak > self._impulse_peak:
                     self._impulse_peak = hp_peak
                     self._impulse_snr_db = max(self._impulse_snr_db, snr_db)
-                    self._impulse_hf_ratio = max(self._impulse_hf_ratio, high_freq_ratio)
+                    self._impulse_hf_ratio = high_freq_ratio
 
                 current_duration = self._impulse_last_active_ms - self._impulse_start_ms
                 if current_duration > self.max_clap_duration_ms:
                     self._impulse_invalidated = True
             else:
+                # Impuls ist echt unter die Release-Schwelle abgeklungen!
+                self._quiet_blocks_since_impulse = 1
                 impulse_duration = max(
                     block_duration_ms,
                     self._impulse_last_active_ms - self._impulse_start_ms,
@@ -253,11 +257,17 @@ class ClapDetector:
                 imp_snr = self._impulse_snr_db
                 imp_hf = self._impulse_hf_ratio
                 invalidated = self._impulse_invalidated
-                impulse_time_ms = self._impulse_start_ms + (impulse_duration * 0.5)
+                # Nutze den Startzeitpunkt des Impulses (Anstiegsflanke) für präzise Abstandsmessung
+                impulse_time_ms = self._impulse_start_ms
 
                 self._in_impulse = False
                 self._impulse_peak = 0.0
                 self._impulse_invalidated = False
+
+                # Trage die wahren Spitzenwerte des Impulses in diag ein (für die Log-Ausgabe)
+                diag.hp_peak = peak
+                diag.snr_db = imp_snr
+                diag.high_freq_ratio = imp_hf
 
                 if invalidated or impulse_duration > self.max_clap_duration_ms:
                     diag.rejected_reason = f"duration_too_long ({impulse_duration:.0f}ms)"
