@@ -1,4 +1,4 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.12-alpine
+ARG BUILD_FROM=alpine:3.20
 FROM ${BUILD_FROM}
 
 # Install ready-to-use Alpine packages (no slow C compilation needed)
@@ -9,7 +9,8 @@ RUN apk add --no-cache \
     py3-yaml \
     pulseaudio-utils \
     alsa-utils \
-    alsa-plugins-pulse
+    alsa-plugins-pulse \
+    ffmpeg
 
 WORKDIR /app
 COPY detector.py ha_client.py clap_sensor.py config.yaml /app/

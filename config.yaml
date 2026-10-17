@@ -1,5 +1,5 @@
 name: "Clap Sensor (Double & Triple Clap)"
-version: "1.0.0"
+version: "1.1.3"
 slug: "clap_sensor"
 description: "Erkennt Doppel- und Dreifachklatschen über ein USB-Mikrofon (z. B. USB-Webcam) mit Lüfterrauschen-Filter und schaltet Home Assistant Entitäten oder feuert Events."
 arch:
@@ -16,14 +16,14 @@ options:
   input_device: "default"
   sample_rate: 16000
   block_duration_ms: 16
-  min_amplitude: 0.05
-  snr_threshold_db: 12.0
-  max_clap_duration_ms: 150
-  min_high_freq_ratio: 0.30
-  double_clap_min_gap_ms: 140
-  double_clap_max_gap_ms: 650
+  min_amplitude: 0.02
+  snr_threshold_db: 8.5
+  max_clap_duration_ms: 200
+  min_high_freq_ratio: 0.24
+  double_clap_min_gap_ms: 100
+  double_clap_max_gap_ms: 850
   settle_window_ms: 480
-  cooldown_ms: 1500
+  cooldown_ms: 1200
   enable_triple_clap: true
   target_entity_id: ""
   target_service: "homeassistant.toggle"
