@@ -80,10 +80,10 @@ class ClapDetector:
     def __init__(
         self,
         sample_rate: int = 16000,
-        min_amplitude: float = 0.18,
-        snr_threshold_db: float = 18.0,
+        min_amplitude: float = 0.15,
+        snr_threshold_db: float = 16.0,
         max_clap_duration_ms: float = 160.0,
-        min_high_freq_ratio: float = 0.65,
+        min_high_freq_ratio: float = 0.50,
         double_clap_min_gap_ms: float = 170.0,
         double_clap_max_gap_ms: float = 700.0,
         settle_window_ms: float = 480.0,
