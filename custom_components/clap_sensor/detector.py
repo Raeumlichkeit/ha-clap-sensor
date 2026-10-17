@@ -1,9 +1,42 @@
 from __future__ import annotations
 
+import ctypes
 import math
+import sys
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, List, Optional
+
+
+class WindowsInputGuard:
+    """
+    Erkennt unter Windows, ob in den letzten X Millisekunden eine Taste gedrückt
+    oder die Maus bewegt/geklickt wurde. Auf Linux/HAOS ist dieser Check ein No-Op.
+    """
+
+    class _LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_uint),
+            ("dwTime", ctypes.c_uint),
+        ]
+
+    def __init__(self, ignore_window_ms: int = 400) -> None:
+        self.ignore_window_ms = max(0, int(ignore_window_ms))
+        self._is_windows = sys.platform == "win32"
+
+    def is_user_typing_or_clicking(self) -> bool:
+        if not self._is_windows or self.ignore_window_ms <= 0:
+            return False
+        try:
+            lii = self._LASTINPUTINFO()
+            lii.cbSize = ctypes.sizeof(self._LASTINPUTINFO)
+            if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+                tick_count = ctypes.windll.kernel32.GetTickCount()
+                elapsed_ms = (tick_count - lii.dwTime) & 0xFFFFFFFF
+                return elapsed_ms < self.ignore_window_ms
+        except Exception:
+            return False
+        return False
 
 
 @dataclass
@@ -32,31 +65,31 @@ class BlockDiagnostics:
 
 class ClapDetector:
     """
-    Mehrstufiger Echtzeit-Klatschdetektor (DSP + FFT + Zustandsmaschine) für HAOS / HACS:
+    Raumhall-optimierter Echtzeit-Klatschdetektor (DSP + FFT + Zustandsmaschine):
     1. Hochpass-Filterung (> 800 Hz) vor der Rauschpegel-Messung blendet
        Proxmox-Serverlüfter und tieffrequentes Brummen aus.
-    2. Hüllkurven-Prüfung (steiler Anstieg, kurzes Decay <= max_clap_duration_ms)
-       trennt kurze Klatsch-Impulse von Sprache.
-    3. Spektrale Band-Ratio (1000-4800 Hz vs. Tiefton 120-750 Hz) filtert
+    2. Dynamische Peak-Release-Erkennung (35 % vom Impuls-Peak) trennt den
+       eigentlichen Klatsch-Impuls sauber vom Raum-Nachhall (Reverb).
+    3. Einfrieren des Noise-Floors nach Klatsch #1 verhindert, dass der Nachhall
+       des 1. Klatschens die Schwelle für das 2. Klatschen anhebt.
+    4. Spektrale Band-Ratio (900-5000 Hz vs. Tiefton 120-750 Hz) filtert
        dumpfe Tischstöße, Schritte und Türenschlagen heraus.
-    4. Zustandsmaschine mit Settle-Window unterscheidet sauber zwischen
-       Einzelklatsch (ignoriert), Doppelklatsch (2x), Dreifachklatsch (3x)
-       und Applaus (>= 4x, ignoriert).
     """
 
     def __init__(
         self,
         sample_rate: int = 16000,
-        min_amplitude: float = 0.05,
-        snr_threshold_db: float = 12.0,
-        max_clap_duration_ms: float = 150.0,
-        min_high_freq_ratio: float = 0.30,
-        double_clap_min_gap_ms: float = 140.0,
-        double_clap_max_gap_ms: float = 650.0,
+        min_amplitude: float = 0.02,
+        snr_threshold_db: float = 8.5,
+        max_clap_duration_ms: float = 200.0,
+        min_high_freq_ratio: float = 0.24,
+        double_clap_min_gap_ms: float = 100.0,
+        double_clap_max_gap_ms: float = 850.0,
         settle_window_ms: float = 480.0,
-        cooldown_ms: float = 1500.0,
+        cooldown_ms: float = 1200.0,
         enable_triple_clap: bool = True,
         highpass_cutoff_hz: float = 800.0,
+        input_guard: Optional[WindowsInputGuard] = None,
     ) -> None:
         import numpy as np
 
@@ -72,9 +105,10 @@ class ClapDetector:
         self.cooldown_ms = float(cooldown_ms)
         self.enable_triple_clap = bool(enable_triple_clap)
         self.highpass_cutoff_hz = float(highpass_cutoff_hz)
+        self.input_guard = input_guard
 
         self._noise_history: Deque[float] = deque(maxlen=60)
-        self._noise_floor: float = 0.003
+        self._noise_floor: float = 0.0025
 
         self._in_impulse: bool = False
         self._impulse_start_ms: float = 0.0
@@ -92,6 +126,10 @@ class ClapDetector:
         self._last_trigger_ms: float = -1e9
         self._elapsed_ms: float = 0.0
         self.last_diagnostics: Optional[BlockDiagnostics] = None
+
+    @property
+    def noise_floor(self) -> float:
+        return self._noise_floor
 
     def process_block(
         self,
@@ -135,7 +173,7 @@ class ClapDetector:
         hp_rms = float(np.sqrt(np.mean(x_hp * x_hp)) + 1e-9)
 
         total_relevant_mask = (freqs >= 120.0) & (freqs <= 6500.0)
-        clap_band_mask = (freqs >= 1000.0) & (freqs <= 4800.0)
+        clap_band_mask = (freqs >= 900.0) & (freqs <= 5200.0)
         low_thud_mask = (freqs >= 120.0) & (freqs < 750.0)
 
         total_energy = float(np.sum(power[total_relevant_mask])) + 1e-12
@@ -165,11 +203,19 @@ class ClapDetector:
             return None
 
         required_linear_snr = 10.0 ** (self.snr_threshold_db / 20.0)
+        # Falls bereits Klatsch #1 erkannt wurde, senken wir die Schwelle für Klatsch #2 leicht um 15 %,
+        # da beim Doppelklatschen ein Schlag oft minimal leiser ist als der andere!
+        if self._clap_times:
+            required_linear_snr *= 0.82
         onset_threshold = max(self.min_amplitude, self._noise_floor * required_linear_snr)
-        release_threshold = max(self.min_amplitude * 0.45, self._noise_floor * (required_linear_snr * 0.45))
 
         if not self._in_impulse:
             if hp_peak >= onset_threshold:
+                if self.input_guard and self.input_guard.is_user_typing_or_clicking():
+                    diag.rejected_reason = "pc_input_guard_active"
+                    self.last_diagnostics = diag
+                    return None
+
                 self._in_impulse = True
                 self._impulse_start_ms = now_ms - block_duration_ms
                 self._impulse_last_active_ms = now_ms
@@ -178,14 +224,22 @@ class ClapDetector:
                 self._impulse_hf_ratio = high_freq_ratio
                 self._impulse_invalidated = False
             else:
-                self._update_noise_floor_if_quiet(hp_rms, hp_peak)
+                # Wichtig: Während wir auf den 2./3. Klatsch warten, den Noise-Floor NICHT durch Raumhall anheben!
+                if not self._clap_times:
+                    self._update_noise_floor_if_quiet(hp_rms, hp_peak)
         else:
-            if hp_peak >= release_threshold:
+            # Sobald der Pegel unter 38 % des Impuls-Maximums (oder unter 55 % der Startschwelle) fällt,
+            # ist der eigentliche Handklatsch vorbei und nur noch Raum-Nachhall übrig.
+            dynamic_release = max(
+                onset_threshold * 0.55,
+                self._impulse_peak * 0.38,
+            )
+            if hp_peak >= dynamic_release:
                 self._impulse_last_active_ms = now_ms
                 if hp_peak > self._impulse_peak:
                     self._impulse_peak = hp_peak
                     self._impulse_snr_db = max(self._impulse_snr_db, snr_db)
-                    self._impulse_hf_ratio = high_freq_ratio
+                    self._impulse_hf_ratio = max(self._impulse_hf_ratio, high_freq_ratio)
 
                 current_duration = self._impulse_last_active_ms - self._impulse_start_ms
                 if current_duration > self.max_clap_duration_ms:

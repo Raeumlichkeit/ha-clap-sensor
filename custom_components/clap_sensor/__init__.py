@@ -336,11 +336,23 @@ class ClapAudioWorker:
         bytes_per_block = block_samples * 2
         input_device = str(cfg.get(CONF_INPUT_DEVICE, DEFAULT_INPUT_DEVICE)).strip()
 
+        raw_amp = float(cfg.get(CONF_MIN_AMPLITUDE, DEFAULT_MIN_AMPLITUDE))
+        if CONF_MIN_AMPLITUDE not in self.entry.options and raw_amp in (0.05, 0.04):
+            raw_amp = DEFAULT_MIN_AMPLITUDE
+
+        raw_snr = float(cfg.get(CONF_SNR_THRESHOLD_DB, DEFAULT_SNR_THRESHOLD_DB))
+        if CONF_SNR_THRESHOLD_DB not in self.entry.options and raw_snr in (12.0, 10.0):
+            raw_snr = DEFAULT_SNR_THRESHOLD_DB
+
+        raw_hf = float(cfg.get(CONF_MIN_HIGH_FREQ_RATIO, DEFAULT_MIN_HIGH_FREQ_RATIO))
+        if CONF_MIN_HIGH_FREQ_RATIO not in self.entry.options and raw_hf in (0.30, 0.25):
+            raw_hf = DEFAULT_MIN_HIGH_FREQ_RATIO
+
         detector = ClapDetector(
             sample_rate=sample_rate,
-            min_amplitude=float(cfg.get(CONF_MIN_AMPLITUDE, DEFAULT_MIN_AMPLITUDE)),
-            snr_threshold_db=float(cfg.get(CONF_SNR_THRESHOLD_DB, DEFAULT_SNR_THRESHOLD_DB)),
-            min_high_freq_ratio=float(cfg.get(CONF_MIN_HIGH_FREQ_RATIO, DEFAULT_MIN_HIGH_FREQ_RATIO)),
+            min_amplitude=raw_amp,
+            snr_threshold_db=raw_snr,
+            min_high_freq_ratio=raw_hf,
             enable_triple_clap=bool(cfg.get(CONF_ENABLE_TRIPLE_CLAP, DEFAULT_ENABLE_TRIPLE_CLAP)),
         )
 
