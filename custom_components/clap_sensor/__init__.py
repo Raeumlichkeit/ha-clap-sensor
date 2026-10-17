@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 import queue
 import re
@@ -12,6 +13,7 @@ import time
 from typing import Any, Optional
 
 import numpy as np
+import requests
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
@@ -47,11 +49,95 @@ PLATFORMS: list[Platform] = [
 ]
 
 
+def configure_haos_supervisor_audio() -> tuple[Optional[str], str]:
+    """
+    Fragt den Home Assistant Supervisor Audio-Dienst (http://supervisor/audio/info) ab,
+    sucht das USB-Webcam-Mikrofon, schaltet es automatisch stummfrei (unmute),
+    setzt die Eingangs-Lautstärke auf 100 % und aktiviert es als Standard-Eingang!
+    Gibt (pulse_source_name, diagnose_text) zurück.
+    """
+    token = (
+        os.environ.get("SUPERVISOR_TOKEN")
+        or os.environ.get("HASSIO_TOKEN")
+        or ""
+    ).strip()
+    if not token:
+        return None, "Kein SUPERVISOR_TOKEN"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        # Optional: Audio-Hardware im Supervisor neu einlesen lassen, falls Webcam per Hotplug kam
+        requests.post("http://supervisor/audio/reload", headers=headers, timeout=3.0)
+    except Exception:
+        pass
+
+    try:
+        resp = requests.get("http://supervisor/audio/info", headers=headers, timeout=4.0)
+        if not resp.ok:
+            return None, f"Supervisor Audio HTTP {resp.status_code}"
+        payload = resp.json()
+        audio_data = payload.get("data", {}).get("audio", {})
+        inputs: list[dict[str, Any]] = audio_data.get("input", []) or []
+    except Exception as exc:
+        return None, f"Supervisor Audio Fehler: {exc}"
+
+    if not inputs:
+        return None, "Keine Mikrofone in Supervisor Audio gefunden"
+
+    # Bevorzuge USB-/Webcam-Mikrofon, sonst erstes echtes Eingabegerät
+    chosen: dict[str, Any] = inputs[0]
+    for inp in inputs:
+        name_desc = f"{inp.get('name', '')} {inp.get('description', '')}".lower()
+        if "usb" in name_desc or "webcam" in name_desc or "c270" in name_desc:
+            chosen = inp
+            break
+
+    src_name = str(chosen.get("name", "")).strip()
+    src_idx = chosen.get("index")
+    src_desc = str(chosen.get("description", src_name)).strip()
+
+    # 1. Als Standard-Eingabegerät in HAOS setzen
+    if src_name:
+        try:
+            requests.post(
+                "http://supervisor/audio/default/input",
+                headers=headers,
+                json={"name": src_name},
+                timeout=3.0,
+            )
+        except Exception:
+            pass
+
+    # 2. Stummschaltung aufheben (Unmute) & Pegel auf 100 % (1.0) setzen
+    if src_idx is not None:
+        try:
+            requests.post(
+                "http://supervisor/audio/mute/input",
+                headers=headers,
+                json={"index": src_idx, "active": False},
+                timeout=3.0,
+            )
+            requests.post(
+                "http://supervisor/audio/volume/input",
+                headers=headers,
+                json={"index": src_idx, "volume": 1.0},
+                timeout=3.0,
+            )
+        except Exception:
+            pass
+
+    all_names = ", ".join(
+        f"{i.get('description') or i.get('name')}" for i in inputs
+    )
+    return src_name, f"Aktiviert: {src_desc} (Alle: {all_names})"
+
+
 def discover_alsa_usb_cards() -> tuple[list[str], str]:
-    """
-    Liest /proc/asound/cards aus, um angeschlossene USB-Mikrofone/Webcams
-    (z. B. Logi C270) automatisch als ALSA-Devices (plughw:X,0) zu finden.
-    """
+    """Liest /proc/asound/cards aus, um angeschlossene USB-Mikrofone zu finden."""
     cards_file = Path("/proc/asound/cards")
     if not cards_file.is_file():
         return [], "Kein /proc/asound/cards"
@@ -62,7 +148,7 @@ def discover_alsa_usb_cards() -> tuple[list[str], str]:
         return [], f"Fehler: {exc}"
 
     if not content or "no soundcards" in content.lower():
-        return [], "Keine Soundkarte in HAOS gefunden (USB-Passthrough prüfen!)"
+        return [], "Keine Soundkarte in /proc/asound/cards"
 
     usb_devices: list[str] = []
     other_devices: list[str] = []
@@ -71,112 +157,40 @@ def discover_alsa_usb_cards() -> tuple[list[str], str]:
     for line in content.splitlines():
         m = re.match(r"^\s*(\d+)\s+\[([^\]]+)\]:\s*(.+)$", line)
         if m:
-            card_num, card_id, card_desc = m.group(1), m.group(2).strip(), m.group(3).strip()
+            card_num, _card_id, card_desc = m.group(1), m.group(2).strip(), m.group(3).strip()
             summary_lines.append(f"Card {card_num}: {card_desc}")
-            dev_str = f"plughw:{card_num},0"
+            # dsnoop erlaubt geteilten Zugriff, falls PulseAudio die Karte offen hält
             if "usb" in card_desc.lower() or "webcam" in card_desc.lower() or "c270" in card_desc.lower():
-                usb_devices.append(dev_str)
+                usb_devices.extend([f"plughw:{card_num},0", f"dsnoop:{card_num},0", f"hw:{card_num},0"])
             else:
-                other_devices.append(dev_str)
+                other_devices.append(f"plughw:{card_num},0")
 
     ordered = usb_devices + other_devices
     return ordered, "; ".join(summary_lines) if summary_lines else content[:120]
 
 
 def _build_capture_commands(
-    input_device: str, sample_rate: int = 16000
-) -> tuple[list[tuple[str, list[str]]], str]:
+    input_device: str,
+    pulse_source: Optional[str],
+    sample_rate: int = 16000,
+) -> tuple[list[tuple[str, list[str], dict[str, str]]], str]:
     """
-    Erzeugt eine priorisierte Liste von (Name, Kommando)-Tupeln für die Audio-Aufnahme
-    innerhalb des Home Assistant Core Containers.
+    Erzeugt eine priorisierte Liste von (Label, Kommando, Env-Dict)-Tupeln.
     """
     dev = (input_device or "auto").strip()
     alsa_devs, cards_summary = discover_alsa_usb_cards()
-    cmds: list[tuple[str, list[str]]] = []
+    cmds: list[tuple[str, list[str], dict[str, str]]] = []
+
+    base_env = dict(os.environ)
+    if pulse_source:
+        base_env["PULSE_SOURCE"] = pulse_source
 
     explicit_dev = dev.lower() not in ("default", "auto", "")
 
-    # 1. Falls ein explizites Gerät angegeben wurde, dieses zuerst testen
-    if explicit_dev:
-        if shutil.which("ffmpeg"):
-            cmds.append(
-                (
-                    f"ffmpeg ALSA ({dev})",
-                    [
-                        "ffmpeg",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-nostdin",
-                        "-f",
-                        "alsa",
-                        "-i",
-                        dev,
-                        "-ac",
-                        "1",
-                        "-ar",
-                        str(sample_rate),
-                        "-f",
-                        "s16le",
-                        "-",
-                    ],
-                )
-            )
-            cmds.append(
-                (
-                    f"ffmpeg Pulse ({dev})",
-                    [
-                        "ffmpeg",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-nostdin",
-                        "-f",
-                        "pulse",
-                        "-i",
-                        dev,
-                        "-ac",
-                        "1",
-                        "-ar",
-                        str(sample_rate),
-                        "-f",
-                        "s16le",
-                        "-",
-                    ],
-                )
-            )
-
-    # 2. Automatisch gefundene ALSA USB-Mikrofone (z. B. plughw:1,0 oder plughw:0,0) via ffmpeg
-    if shutil.which("ffmpeg"):
-        for alsa_dev in alsa_devs:
-            cmds.append(
-                (
-                    f"USB-Audio ({alsa_dev})",
-                    [
-                        "ffmpeg",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-nostdin",
-                        "-f",
-                        "alsa",
-                        "-i",
-                        alsa_dev,
-                        "-ac",
-                        "1",
-                        "-ar",
-                        str(sample_rate),
-                        "-f",
-                        "s16le",
-                        "-",
-                    ],
-                )
-            )
-
-        # 3. PulseAudio Default & ALSA Default via ffmpeg
+    if explicit_dev and shutil.which("ffmpeg"):
         cmds.append(
             (
-                "PulseAudio (default)",
+                f"ALSA ({dev})",
                 [
                     "ffmpeg",
                     "-hide_banner",
@@ -184,9 +198,9 @@ def _build_capture_commands(
                     "error",
                     "-nostdin",
                     "-f",
-                    "pulse",
+                    "alsa",
                     "-i",
-                    "default",
+                    dev,
                     "-ac",
                     "1",
                     "-ar",
@@ -195,11 +209,16 @@ def _build_capture_commands(
                     "s16le",
                     "-",
                 ],
+                base_env,
             )
         )
+
+    if shutil.which("ffmpeg"):
+        # 1. In HAOS leitet ALSA 'default' über /etc/asound.conf direkt an PulseAudio weiter.
+        # Mit gesetztem PULSE_SOURCE greift 'default' exakt die USB-Webcam ab!
         cmds.append(
             (
-                "ALSA (default)",
+                f"HAOS Audio ({pulse_source or 'default'})",
                 [
                     "ffmpeg",
                     "-hide_banner",
@@ -218,42 +237,48 @@ def _build_capture_commands(
                     "s16le",
                     "-",
                 ],
+                base_env,
             )
         )
 
-    # 4. parec / arecord Fallbacks (falls installiert)
-    if shutil.which("parec"):
-        cmds.append(
-            (
-                "parec (PulseAudio)",
-                [
-                    "parec",
-                    f"--rate={sample_rate}",
-                    "--format=s16le",
-                    "--channels=1",
-                    "--latency-msec=16",
-                ],
-            )
-        )
-    if shutil.which("arecord"):
-        for alsa_dev in alsa_devs or ["default"]:
+        # 2. Direkter ALSA-Zugriff auf die USB-Soundkarte (falls PulseAudio sie nicht exklusiv sperrt)
+        for alsa_dev in alsa_devs:
             cmds.append(
                 (
-                    f"arecord ({alsa_dev})",
+                    f"USB-ALSA ({alsa_dev})",
                     [
-                        "arecord",
-                        "-q",
-                        "-D",
-                        alsa_dev,
+                        "ffmpeg",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-nostdin",
                         "-f",
-                        "S16_LE",
-                        "-c",
+                        "alsa",
+                        "-i",
+                        alsa_dev,
+                        "-ac",
                         "1",
-                        "-r",
+                        "-ar",
                         str(sample_rate),
+                        "-f",
+                        "s16le",
+                        "-",
                     ],
+                    base_env,
                 )
             )
+
+    if shutil.which("parec"):
+        parec_cmd = [
+            "parec",
+            f"--rate={sample_rate}",
+            "--format=s16le",
+            "--channels=1",
+            "--latency-msec=16",
+        ]
+        if pulse_source:
+            parec_cmd.append(f"--device={pulse_source}")
+        cmds.append(("parec (PulseAudio)", parec_cmd, base_env))
 
     return cmds, cards_summary
 
@@ -319,23 +344,29 @@ class ClapAudioWorker:
 
         cmd_idx = 0
         while not self._stop_event.is_set():
-            cmds, cards_summary = _build_capture_commands(input_device, sample_rate)
+            # Vor jedem Startversuch das USB-Mikrofon in HAOS Supervisor Audio aktivieren & entstummen
+            pulse_source, supervisor_info = configure_haos_supervisor_audio()
+            cmds, cards_summary = _build_capture_commands(
+                input_device, pulse_source, sample_rate
+            )
             self.status_attributes["alsa_soundcards"] = cards_summary
+            self.status_attributes["supervisor_audio"] = supervisor_info
 
             if not cmds:
                 self._publish_status(
-                    "Kein Audio-Tool gefunden (nutze Add-on)",
+                    "Kein Audio-Tool gefunden",
                     {"alsa_soundcards": cards_summary},
                 )
                 return
 
-            label, cmd = cmds[cmd_idx % len(cmds)]
+            label, cmd, env = cmds[cmd_idx % len(cmds)]
             proc: Optional[subprocess.Popen] = None
             try:
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    env=env,
                     bufsize=bytes_per_block * 4,
                 )
                 q: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=64)
@@ -356,39 +387,62 @@ class ClapAudioWorker:
 
                 zero_blocks = 0
                 blocks_read = 0
+                max_peak_window = 0.0
+
                 while not self._stop_event.is_set():
                     try:
-                        chunk = q.get(timeout=3.5)
+                        chunk = q.get(timeout=4.0)
                     except queue.Empty:
                         raise RuntimeError(f"Timeout bei {label}")
 
                     if chunk is None or len(chunk) < bytes_per_block:
-                        err_txt = ""
-                        if proc.stderr:
-                            try:
-                                err_txt = proc.stderr.read().decode("utf-8", errors="ignore").strip()
-                            except Exception:
-                                pass
-                        raise RuntimeError(f"{label} beendet: {err_txt[:120] or 'EOF'}")
+                        raise RuntimeError(f"{label} konnte Gerät nicht öffnen")
 
                     samples = np.frombuffer(chunk, dtype=np.int16)
-                    if np.max(np.abs(samples)) == 0:
+                    raw_max = int(np.max(np.abs(samples)))
+                    norm_peak = raw_max / 32768.0
+                    if norm_peak > max_peak_window:
+                        max_peak_window = norm_peak
+
+                    if raw_max == 0:
                         zero_blocks += 1
-                        if zero_blocks >= 400:
-                            raise RuntimeError(f"{label} liefert nur Stille/Null-Bytes")
+                        # Falls 15 Sekunden lang exakt digitale Nullen kommen, einmalig Supervisor Audio neu setzen,
+                        # aber den laufenden Stream NICHT abbrechen, sondern offen halten!
+                        if zero_blocks == 900:
+                            configure_haos_supervisor_audio()
+                            self._publish_status(
+                                f"Aktiv ({label}) - Signalpegel ist 0 (Mikrofon stumm?)",
+                                {
+                                    "live_peak": 0.0,
+                                    "supervisor_audio": supervisor_info,
+                                    "alsa_soundcards": cards_summary,
+                                },
+                            )
                     else:
                         zero_blocks = 0
 
                     blocks_read += 1
-                    if blocks_read == 15:
-                        _LOGGER.info("Clap Sensor Mikrofon aktiv über: %s", label)
+                    if blocks_read == 20:
+                        _LOGGER.info("Clap Sensor Mikrofon-Stream stabil über: %s", label)
                         self._publish_status(
-                            f"Aktiv: {label}",
+                            f"Bereit ({label})",
                             {
                                 "active_backend": label,
+                                "live_peak": round(max_peak_window, 4),
                                 "noise_floor": round(detector._noise_floor, 5),
                             },
                         )
+                    elif blocks_read % 200 == 0 and raw_max > 0:
+                        # Alle ~3,2 Sekunden Live-Pegel im Sensor aktualisieren
+                        self._publish_status(
+                            f"Bereit ({label})",
+                            {
+                                "active_backend": label,
+                                "live_peak": round(max_peak_window, 4),
+                                "noise_floor": round(detector._noise_floor, 5),
+                            },
+                        )
+                        max_peak_window = 0.0
 
                     ev = detector.process_block(samples)
                     diag = detector.last_diagnostics
@@ -396,7 +450,7 @@ class ClapAudioWorker:
                     if diag is not None:
                         if diag.single_clap_registered:
                             self._publish_status(
-                                f"Aktiv: {label} (Klatsch #{diag.clap_count_in_buffer} gehört)",
+                                f"Klatsch #{diag.clap_count_in_buffer} erkannt! ({label})",
                                 {
                                     "last_heard_peak": round(diag.hp_peak, 4),
                                     "last_heard_snr_db": round(diag.snr_db, 1),
@@ -406,7 +460,7 @@ class ClapAudioWorker:
                             )
                         elif diag.rejected_reason:
                             self._publish_status(
-                                f"Aktiv: {label}",
+                                f"Bereit ({label})",
                                 {
                                     "last_rejected_reason": diag.rejected_reason,
                                     "last_heard_peak": round(diag.hp_peak, 4),
@@ -424,10 +478,10 @@ class ClapAudioWorker:
                     break
                 cmd_idx += 1
                 self._publish_status(
-                    f"Suche Mikrofon... ({cards_summary[:60]})",
+                    f"Verbinde Mikrofon... ({cards_summary[:50]})",
                     {"last_error": str(exc)},
                 )
-                time.sleep(2.5)
+                time.sleep(2.0)
             finally:
                 if proc is not None:
                     try:
