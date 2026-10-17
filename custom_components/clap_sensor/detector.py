@@ -80,10 +80,10 @@ class ClapDetector:
     def __init__(
         self,
         sample_rate: int = 16000,
-        min_amplitude: float = 0.15,
-        snr_threshold_db: float = 16.0,
+        min_amplitude: float = 0.05,
+        snr_threshold_db: float = 12.0,
         max_clap_duration_ms: float = 160.0,
-        min_high_freq_ratio: float = 0.50,
+        min_high_freq_ratio: float = 0.30,
         double_clap_min_gap_ms: float = 170.0,
         double_clap_max_gap_ms: float = 700.0,
         settle_window_ms: float = 480.0,
@@ -238,10 +238,10 @@ class ClapDetector:
         else:
             if hp_peak >= release_threshold:
                 self._impulse_last_active_ms = now_ms
+                self._impulse_hf_ratio = max(self._impulse_hf_ratio, high_freq_ratio)
                 if hp_peak > self._impulse_peak:
                     self._impulse_peak = hp_peak
                     self._impulse_snr_db = max(self._impulse_snr_db, snr_db)
-                    self._impulse_hf_ratio = high_freq_ratio
 
                 current_duration = self._impulse_last_active_ms - self._impulse_start_ms
                 if current_duration > self.max_clap_duration_ms:
