@@ -1,0 +1,55 @@
+name: "Clap Sensor (Double & Triple Clap)"
+version: "1.0.0"
+slug: "clap_sensor"
+description: "Erkennt Doppel- und Dreifachklatschen über ein USB-Mikrofon (z. B. USB-Webcam) mit Lüfterrauschen-Filter und schaltet Home Assistant Entitäten oder feuert Events."
+arch:
+  - amd64
+  - aarch64
+  - armv7
+init: false
+audio: true
+homeassistant_api: true
+startup: application
+boot: auto
+options:
+  audio_backend: "auto"
+  input_device: "default"
+  sample_rate: 16000
+  block_duration_ms: 16
+  min_amplitude: 0.05
+  snr_threshold_db: 12.0
+  max_clap_duration_ms: 150
+  min_high_freq_ratio: 0.30
+  double_clap_min_gap_ms: 140
+  double_clap_max_gap_ms: 650
+  settle_window_ms: 480
+  cooldown_ms: 1500
+  enable_triple_clap: true
+  target_entity_id: ""
+  target_service: "homeassistant.toggle"
+  triple_clap_entity_id: ""
+  triple_clap_service: "homeassistant.toggle"
+  webhook_url: ""
+  ignore_during_pc_input_ms: 400
+  log_calibration: true
+schema:
+  audio_backend: "list(auto|parec|arecord|sounddevice)"
+  input_device: "str"
+  sample_rate: "int(8000,48000)"
+  block_duration_ms: "int(10,50)"
+  min_amplitude: "float(0.005,0.95)"
+  snr_threshold_db: "float(4.0,35.0)"
+  max_clap_duration_ms: "int(40,350)"
+  min_high_freq_ratio: "float(0.10,0.85)"
+  double_clap_min_gap_ms: "int(80,400)"
+  double_clap_max_gap_ms: "int(300,1200)"
+  settle_window_ms: "int(250,900)"
+  cooldown_ms: "int(500,5000)"
+  enable_triple_clap: "bool"
+  target_entity_id: "str?"
+  target_service: "str?"
+  triple_clap_entity_id: "str?"
+  triple_clap_service: "str?"
+  webhook_url: "str?"
+  ignore_during_pc_input_ms: "int(0,2000)?"
+  log_calibration: "bool"

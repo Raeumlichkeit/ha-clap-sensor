@@ -1,0 +1,34 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Clap Sensor (USB-Mikrofon) einrichten",
+        "description": "Konfiguriert die Doppel- und Dreifachklatsch-Erkennung über ein angeschlossenes USB-Mikrofon (z. B. USB-Webcam) oder über Events des Clap-Sensor-Add-ons.",
+        "data": {
+          "input_device": "Audio-Eingabegerät ('default' für Standard-USB-Mikrofon oder 'event_only')",
+          "min_amplitude": "Minimale Spitzen-Amplitude (0.005 bis 0.95)",
+          "snr_threshold_db": "Mindestabstand zum Hintergrund-/Lüfterrauschen in dB",
+          "min_high_freq_ratio": "Min. Hochtonanteil 1–4.8 kHz (filtert dumpfe Stöße)",
+          "enable_triple_clap": "Dreifachklatschen (3x Klatschen) aktivieren"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Der Clap Sensor ist bereits eingerichtet."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Clap Sensor Empfindlichkeit anpassen",
+        "data": {
+          "input_device": "Audio-Eingabegerät ('default' oder 'event_only')",
+          "min_amplitude": "Minimale Spitzen-Amplitude (0.005 bis 0.95)",
+          "snr_threshold_db": "Mindestabstand zum Hintergrund-/Lüfterrauschen in dB",
+          "min_high_freq_ratio": "Min. Hochtonanteil 1–4.8 kHz (filtert dumpfe Stöße)",
+          "enable_triple_clap": "Dreifachklatschen (3x Klatschen) aktivieren"
+        }
+      }
+    }
+  }
+}

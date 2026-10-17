@@ -1,0 +1,34 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Clap Sensor (USB Microphone)",
+        "description": "Configures double and triple clap detection via an attached USB microphone (e.g. USB webcam) or via events from the Clap Sensor Add-on.",
+        "data": {
+          "input_device": "Audio input device ('default' for default USB mic or 'event_only')",
+          "min_amplitude": "Minimum peak amplitude (0.005 to 0.95)",
+          "snr_threshold_db": "Minimum SNR above background/fan noise in dB",
+          "min_high_freq_ratio": "Min. high-frequency ratio 1–4.8 kHz (filters low thuds)",
+          "enable_triple_clap": "Enable Triple Clap (3x clap) detection"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Clap Sensor is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Adjust Clap Sensor Sensitivity",
+        "data": {
+          "input_device": "Audio input device ('default' or 'event_only')",
+          "min_amplitude": "Minimum peak amplitude (0.005 to 0.95)",
+          "snr_threshold_db": "Minimum SNR above background/fan noise in dB",
+          "min_high_freq_ratio": "Min. high-frequency ratio 1–4.8 kHz (filters low thuds)",
+          "enable_triple_clap": "Enable Triple Clap (3x clap) detection"
+        }
+      }
+    }
+  }
+}
