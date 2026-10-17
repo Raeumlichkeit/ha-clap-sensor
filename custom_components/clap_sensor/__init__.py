@@ -54,7 +54,6 @@ def configure_haos_supervisor_audio() -> tuple[Optional[str], str]:
     Fragt den Home Assistant Supervisor Audio-Dienst (http://supervisor/audio/info) ab,
     sucht das USB-Webcam-Mikrofon, schaltet es automatisch stummfrei (unmute),
     setzt die Eingangs-Lautstärke auf 100 % und aktiviert es als Standard-Eingang!
-    Gibt (pulse_source_name, diagnose_text) zurück.
     """
     token = (
         os.environ.get("SUPERVISOR_TOKEN")
@@ -70,7 +69,6 @@ def configure_haos_supervisor_audio() -> tuple[Optional[str], str]:
     }
 
     try:
-        # Optional: Audio-Hardware im Supervisor neu einlesen lassen, falls Webcam per Hotplug kam
         requests.post("http://supervisor/audio/reload", headers=headers, timeout=3.0)
     except Exception:
         pass
@@ -88,19 +86,28 @@ def configure_haos_supervisor_audio() -> tuple[Optional[str], str]:
     if not inputs:
         return None, "Keine Mikrofone in Supervisor Audio gefunden"
 
-    # Bevorzuge USB-/Webcam-Mikrofon, sonst erstes echtes Eingabegerät
-    chosen: dict[str, Any] = inputs[0]
+    # Suche gezielt nach einem USB-Mikrofon (ignoriere das virtuelle QEMU HDA-Intel Gerät)
+    chosen: Optional[dict[str, Any]] = None
     for inp in inputs:
         name_desc = f"{inp.get('name', '')} {inp.get('description', '')}".lower()
         if "usb" in name_desc or "webcam" in name_desc or "c270" in name_desc:
             chosen = inp
             break
 
+    if chosen is None:
+        for inp in inputs:
+            name_desc = f"{inp.get('name', '')} {inp.get('description', '')}".lower()
+            if "hda-intel" not in name_desc and "pci-" not in name_desc and "monitor" not in name_desc:
+                chosen = inp
+                break
+
+    if chosen is None:
+        chosen = inputs[0]
+
     src_name = str(chosen.get("name", "")).strip()
     src_idx = chosen.get("index")
     src_desc = str(chosen.get("description", src_name)).strip()
 
-    # 1. Als Standard-Eingabegerät in HAOS setzen
     if src_name:
         try:
             requests.post(
@@ -112,7 +119,6 @@ def configure_haos_supervisor_audio() -> tuple[Optional[str], str]:
         except Exception:
             pass
 
-    # 2. Stummschaltung aufheben (Unmute) & Pegel auf 100 % (1.0) setzen
     if src_idx is not None:
         try:
             requests.post(
@@ -136,22 +142,26 @@ def configure_haos_supervisor_audio() -> tuple[Optional[str], str]:
     return src_name, f"Aktiviert: {src_desc} (Alle: {all_names})"
 
 
-def discover_alsa_usb_cards() -> tuple[list[str], str]:
-    """Liest /proc/asound/cards aus, um angeschlossene USB-Mikrofone zu finden."""
+def discover_alsa_usb_cards() -> tuple[list[str], str, bool]:
+    """
+    Liest /proc/asound/cards aus, um echte USB-Mikrofone zu finden und die
+    tote virtuelle QEMU-Soundkarte (HDA-Intel) zu überspringen.
+    Gibt (usb_alsa_devices, summary_string, has_real_usb_mic) zurück.
+    """
     cards_file = Path("/proc/asound/cards")
     if not cards_file.is_file():
-        return [], "Kein /proc/asound/cards"
+        return [], "Kein /proc/asound/cards", False
 
     try:
         content = cards_file.read_text(encoding="utf-8", errors="ignore").strip()
     except Exception as exc:
-        return [], f"Fehler: {exc}"
+        return [], f"Fehler: {exc}", False
 
     if not content or "no soundcards" in content.lower():
-        return [], "Keine Soundkarte in /proc/asound/cards"
+        return [], "Keine Soundkarte in /proc/asound/cards", False
 
     usb_devices: list[str] = []
-    other_devices: list[str] = []
+    non_virtual_devices: list[str] = []
     summary_lines: list[str] = []
 
     for line in content.splitlines():
@@ -159,26 +169,31 @@ def discover_alsa_usb_cards() -> tuple[list[str], str]:
         if m:
             card_num, _card_id, card_desc = m.group(1), m.group(2).strip(), m.group(3).strip()
             summary_lines.append(f"Card {card_num}: {card_desc}")
-            # dsnoop erlaubt geteilten Zugriff, falls PulseAudio die Karte offen hält
-            if "usb" in card_desc.lower() or "webcam" in card_desc.lower() or "c270" in card_desc.lower():
-                usb_devices.extend([f"plughw:{card_num},0", f"dsnoop:{card_num},0", f"hw:{card_num},0"])
-            else:
-                other_devices.append(f"plughw:{card_num},0")
+            lower_desc = card_desc.lower()
+            if "usb" in lower_desc or "webcam" in lower_desc or "c270" in lower_desc:
+                usb_devices.extend(
+                    [f"plughw:{card_num},0", f"dsnoop:{card_num},0", f"hw:{card_num},0"]
+                )
+            elif "hda-intel" not in lower_desc and "dummy" not in lower_desc:
+                non_virtual_devices.append(f"plughw:{card_num},0")
 
-    ordered = usb_devices + other_devices
-    return ordered, "; ".join(summary_lines) if summary_lines else content[:120]
+    ordered = usb_devices + non_virtual_devices
+    has_usb = len(ordered) > 0
+    return ordered, "; ".join(summary_lines) if summary_lines else content[:120], has_usb
 
 
 def _build_capture_commands(
     input_device: str,
     pulse_source: Optional[str],
     sample_rate: int = 16000,
-) -> tuple[list[tuple[str, list[str], dict[str, str]]], str]:
+) -> tuple[list[tuple[str, list[str], dict[str, str]]], str, bool]:
     """
     Erzeugt eine priorisierte Liste von (Label, Kommando, Env-Dict)-Tupeln.
+    WICHTIG: Echte USB-ALSA-Geräte kommen ZUERST, damit niemals die tote
+    virtuelle QEMU 'HDA-Intel' (Card 0) geöffnet wird!
     """
     dev = (input_device or "auto").strip()
-    alsa_devs, cards_summary = discover_alsa_usb_cards()
+    alsa_devs, cards_summary, has_usb = discover_alsa_usb_cards()
     cmds: list[tuple[str, list[str], dict[str, str]]] = []
 
     base_env = dict(os.environ)
@@ -214,8 +229,34 @@ def _build_capture_commands(
         )
 
     if shutil.which("ffmpeg"):
-        # 1. In HAOS leitet ALSA 'default' über /etc/asound.conf direkt an PulseAudio weiter.
-        # Mit gesetztem PULSE_SOURCE greift 'default' exakt die USB-Webcam ab!
+        # 1. ZUERST echte USB-Soundkarten direkt über ALSA ansprechen!
+        for alsa_dev in alsa_devs:
+            cmds.append(
+                (
+                    f"USB-Audio ({alsa_dev})",
+                    [
+                        "ffmpeg",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-nostdin",
+                        "-f",
+                        "alsa",
+                        "-i",
+                        alsa_dev,
+                        "-ac",
+                        "1",
+                        "-ar",
+                        str(sample_rate),
+                        "-f",
+                        "s16le",
+                        "-",
+                    ],
+                    base_env,
+                )
+            )
+
+        # 2. Danach HAOS Audio (default) über PulseAudio-Bridge
         cmds.append(
             (
                 f"HAOS Audio ({pulse_source or 'default'})",
@@ -241,46 +282,7 @@ def _build_capture_commands(
             )
         )
 
-        # 2. Direkter ALSA-Zugriff auf die USB-Soundkarte (falls PulseAudio sie nicht exklusiv sperrt)
-        for alsa_dev in alsa_devs:
-            cmds.append(
-                (
-                    f"USB-ALSA ({alsa_dev})",
-                    [
-                        "ffmpeg",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-nostdin",
-                        "-f",
-                        "alsa",
-                        "-i",
-                        alsa_dev,
-                        "-ac",
-                        "1",
-                        "-ar",
-                        str(sample_rate),
-                        "-f",
-                        "s16le",
-                        "-",
-                    ],
-                    base_env,
-                )
-            )
-
-    if shutil.which("parec"):
-        parec_cmd = [
-            "parec",
-            f"--rate={sample_rate}",
-            "--format=s16le",
-            "--channels=1",
-            "--latency-msec=16",
-        ]
-        if pulse_source:
-            parec_cmd.append(f"--device={pulse_source}")
-        cmds.append(("parec (PulseAudio)", parec_cmd, base_env))
-
-    return cmds, cards_summary
+    return cmds, cards_summary, has_usb
 
 
 class ClapAudioWorker:
@@ -344,13 +346,25 @@ class ClapAudioWorker:
 
         cmd_idx = 0
         while not self._stop_event.is_set():
-            # Vor jedem Startversuch das USB-Mikrofon in HAOS Supervisor Audio aktivieren & entstummen
             pulse_source, supervisor_info = configure_haos_supervisor_audio()
-            cmds, cards_summary = _build_capture_commands(
+            cmds, cards_summary, has_usb = _build_capture_commands(
                 input_device, pulse_source, sample_rate
             )
             self.status_attributes["alsa_soundcards"] = cards_summary
             self.status_attributes["supervisor_audio"] = supervisor_info
+
+            # Wenn in der HAOS-VM bisher nur "Card 0: HDA-Intel" (virtuelle QEMU-Karte) sichtbar ist,
+            # wurde das USB-Passthrough in Proxmox noch nicht aktiv eingebunden (VM Stop & Start in Proxmox nötig!)
+            if not has_usb and ("usb" not in supervisor_info.lower() and "c270" not in supervisor_info.lower() and "webcam" not in supervisor_info.lower()):
+                self._publish_status(
+                    "Kein USB-Mikrofon in VM sichtbar (nur HDA-Intel) -> HAOS-VM in Proxmox einmal Stoppen & Starten!",
+                    {
+                        "alsa_soundcards": cards_summary,
+                        "supervisor_audio": supervisor_info,
+                    },
+                )
+                time.sleep(5.0)
+                continue
 
             if not cmds:
                 self._publish_status(
@@ -406,23 +420,14 @@ class ClapAudioWorker:
 
                     if raw_max == 0:
                         zero_blocks += 1
-                        # Falls 15 Sekunden lang exakt digitale Nullen kommen, einmalig Supervisor Audio neu setzen,
-                        # aber den laufenden Stream NICHT abbrechen, sondern offen halten!
-                        if zero_blocks == 900:
-                            configure_haos_supervisor_audio()
-                            self._publish_status(
-                                f"Aktiv ({label}) - Signalpegel ist 0 (Mikrofon stumm?)",
-                                {
-                                    "live_peak": 0.0,
-                                    "supervisor_audio": supervisor_info,
-                                    "alsa_soundcards": cards_summary,
-                                },
-                            )
+                        if zero_blocks >= 350:
+                            # Wenn dieses Gerät 5,5s lang nur exakt 0 liefert, probiere das nächste Gerät
+                            raise RuntimeError(f"{label} liefert nur 0-Pegel")
                     else:
                         zero_blocks = 0
 
                     blocks_read += 1
-                    if blocks_read == 20:
+                    if blocks_read == 20 and raw_max > 0:
                         _LOGGER.info("Clap Sensor Mikrofon-Stream stabil über: %s", label)
                         self._publish_status(
                             f"Bereit ({label})",
@@ -433,7 +438,6 @@ class ClapAudioWorker:
                             },
                         )
                     elif blocks_read % 200 == 0 and raw_max > 0:
-                        # Alle ~3,2 Sekunden Live-Pegel im Sensor aktualisieren
                         self._publish_status(
                             f"Bereit ({label})",
                             {
@@ -478,7 +482,7 @@ class ClapAudioWorker:
                     break
                 cmd_idx += 1
                 self._publish_status(
-                    f"Verbinde Mikrofon... ({cards_summary[:50]})",
+                    f"Wechsle Eingang... ({cards_summary[:50]})",
                     {"last_error": str(exc)},
                 )
                 time.sleep(2.0)
